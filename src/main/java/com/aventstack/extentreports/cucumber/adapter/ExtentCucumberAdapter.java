@@ -307,14 +307,6 @@ public class ExtentCucumberAdapter implements Formatter {
         return docStringMap;
     }
 
-    private List<String> createCellList(TableRow row) {
-        List<String> cells = new ArrayList<String>();
-        for (TableCell cell : row.getCells()) {
-            cells.add(cell.getValue());
-        }
-        return cells;
-    }
-
     private void createExamples(Examples examples) {
         List<TableRow> rows = new ArrayList<>();
         rows.add(examples.getTableHeader());
