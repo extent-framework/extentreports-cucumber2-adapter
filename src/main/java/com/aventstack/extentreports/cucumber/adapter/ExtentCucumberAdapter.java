@@ -1,12 +1,21 @@
 package com.aventstack.extentreports.cucumber.adapter;
 
+import java.io.File;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.aventstack.extentreports.ExtentTest;
 import com.aventstack.extentreports.GherkinKeyword;
+import com.aventstack.extentreports.MediaEntityBuilder;
+import com.aventstack.extentreports.Status;
 import com.aventstack.extentreports.markuputils.MarkupHelper;
 import com.aventstack.extentreports.service.ExtentService;
 
@@ -23,6 +32,8 @@ import cucumber.api.event.TestStepFinished;
 import cucumber.api.event.TestStepStarted;
 import cucumber.api.event.WriteEvent;
 import cucumber.api.formatter.Formatter;
+import cucumber.runtime.CucumberException;
+import cucumber.runtime.io.URLOutputStream;
 import gherkin.ast.Background;
 import gherkin.ast.DataTable;
 import gherkin.ast.DocString;
@@ -49,17 +60,32 @@ import gherkin.pickles.PickleTable;
 public class ExtentCucumberAdapter
         implements Formatter {
 
+    private static final String SCREENSHOT_DIR_PROPERTY = "screenshot.dir";
+    
     private static ThreadLocal<ExtentTest> featureTestThreadLocal = new InheritableThreadLocal<>();
     private static ThreadLocal<ExtentTest> scenarioOutlineThreadLocal = new InheritableThreadLocal<>();
     private static ThreadLocal<ExtentTest> scenarioThreadLocal = new InheritableThreadLocal<>();
     private static ThreadLocal<ExtentTest> stepTestThreadLocal = new InheritableThreadLocal<>();
-
+    
+    @SuppressWarnings("serial")
+    private static final Map<String, String> MIME_TYPES_EXTENSIONS = new HashMap<String, String>() {
+        {
+            put("image/bmp", "bmp");
+            put("image/gif", "gif");
+            put("image/jpeg", "jpg");
+            put("image/png", "png");
+            put("image/svg+xml", "svg");
+            put("video/ogg", "ogg");
+        }
+    };
+    
+    private static final AtomicInteger EMBEDDED_INT = new AtomicInteger(0);
+    
     private final TestSourcesModel testSources = new TestSourcesModel();
 
-    private String currentFeatureFile;
-    private Map<String, Object> currentTestCaseMap;
-    private ScenarioOutline currentScenarioOutline;
-    private Examples currentExamples;
+    private ThreadLocal<String> currentFeatureFile = new ThreadLocal<>();
+    private ThreadLocal<ScenarioOutline> currentScenarioOutline = new InheritableThreadLocal<>();
+    private ThreadLocal<Examples> currentExamples = new InheritableThreadLocal<>();
 
     private EventHandler<TestSourceRead> testSourceReadHandler = new EventHandler<TestSourceRead>() {
         @Override
@@ -125,44 +151,67 @@ public class ExtentCucumberAdapter
         handleStartOfFeature(event.testCase);
         handleScenarioOutline(event.testCase);
         createTestCase(event.testCase);
-        if (testSources.hasBackground(currentFeatureFile, event.testCase.getLine())) {
-            createBackground(event.testCase);
+        if (testSources.hasBackground(currentFeatureFile.get(), event.testCase.getLine())) { 
+            // background
         }
     }
 
     private void handleTestStepStarted(TestStepStarted event) {
         if (!event.testStep.isHook()) {
-            if (isFirstStepAfterBackground(event.testStep)) {
-                jsFunctionCall("scenario", currentTestCaseMap);
-                currentTestCaseMap = null;
-            }
             createTestStep(event.testStep);
         }
     }
 
     private void handleTestStepFinished(TestStepFinished event) {
-        if (!event.testStep.isHook()) {
-            createMatchMap(event.testStep, event.result);
-            createResultMap(event.result);
-        } else {
-            createResultMap(event.result);
-        }
+        updateResult(event.result);
     }
 
     private void handleEmbed(EmbedEvent event) {
-        /*String mimeType = event.mimeType;
-        if(mimeType.startsWith("text/")) {
-            // just pass straight to the formatter to output in the html
-            jsFunctionCall("embedding", mimeType, new String(event.data));
-        } else {
-            // Creating a file instead of using data urls to not clutter the js file
-            String extension = MIME_TYPES_EXTENSIONS.get(mimeType);
-            if (extension != null) {
-                StringBuilder fileName = new StringBuilder("embedded").append(embeddedIndex++).append(".").append(extension);
-                writeBytesToURL(event.data, toUrl(fileName.toString()));
-                jsFunctionCall("embedding", mimeType, fileName);
+        String mimeType = event.mimeType;
+        String extension = MIME_TYPES_EXTENSIONS.get(mimeType);
+        if (extension != null) {
+            StringBuilder fileName = new StringBuilder("embedded").append(EMBEDDED_INT.incrementAndGet()).append(".").append(extension);
+            try {
+                URL url = toUrl(fileName.toString());
+                writeBytesToURL(event.data, url);
+                try {
+                    File f = new File(url.toURI());
+                    stepTestThreadLocal.get().info("", MediaEntityBuilder.createScreenCaptureFromPath(f.getAbsolutePath()).build());
+                } catch (URISyntaxException e) {
+                    e.printStackTrace();
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
             }
-        }*/
+        }
+    }
+
+    private static void writeBytesToURL(byte[] buf, URL url) throws IOException {
+        OutputStream out = createReportFileOutputStream(url);
+        try {
+            out.write(buf);
+        } catch (IOException e) {
+            throw new IOException("Unable to write to report file item: ", e);
+        }
+    }
+    
+    private static OutputStream createReportFileOutputStream(URL url) {
+        try {
+            return new URLOutputStream(url);
+        } catch (IOException e) {
+            throw new CucumberException(e);
+        }
+    }
+    
+    private URL toUrl(String fileName) {
+        try {
+            Object prop = ExtentService.getProperty(SCREENSHOT_DIR_PROPERTY);
+            String screenshotDir = prop == null ? "test-output/" : String.valueOf(prop);
+            URL url = Paths.get(screenshotDir, fileName).toUri().toURL();
+            return url;
+        } catch (IOException e) {
+           throw new CucumberException(e);
+        }
     }
 
     private void handleWrite(WriteEvent event) { }
@@ -173,22 +222,23 @@ public class ExtentCucumberAdapter
 
     private void handleStartOfFeature(TestCase testCase) {
         if (currentFeatureFile == null || !currentFeatureFile.equals(testCase.getUri())) {
-            currentFeatureFile = testCase.getUri();
+            currentFeatureFile.set(testCase.getUri());
             createFeature(testCase);
         }
     }
 
-    private Map<String, Object> createFeature(TestCase testCase) {
-        Map<String, Object> featureMap = new HashMap<String, Object>();
+    private void createFeature(TestCase testCase) {
         Feature feature = testSources.getFeature(testCase.getUri());
         if (feature != null) {
+            if (featureTestThreadLocal.get() != null && featureTestThreadLocal.get().getModel().getName().equals(feature.getName())) {
+                return;
+            }
             ExtentTest t = ExtentService.getInstance()
                     .createTest(com.aventstack.extentreports.gherkin.model.Feature.class, feature.getName(), feature.getDescription());
             featureTestThreadLocal.set(t);
             List<String> tagList = createTagsList(feature.getTags());
             tagList.forEach(featureTestThreadLocal.get()::assignCategory);
         }
-        return featureMap;
     }
     
     private List<String> createTagsList(List<Tag> tags) {
@@ -200,23 +250,24 @@ public class ExtentCucumberAdapter
     }
 
     private void handleScenarioOutline(TestCase testCase) {
-        TestSourcesModel.AstNode astNode = testSources.getAstNode(currentFeatureFile, testCase.getLine());
+        TestSourcesModel.AstNode astNode = testSources.getAstNode(currentFeatureFile.get(), testCase.getLine());
         if (TestSourcesModel.isScenarioOutlineScenario(astNode)) {
             ScenarioOutline scenarioOutline = (ScenarioOutline)TestSourcesModel.getScenarioDefinition(astNode);
-            if (currentScenarioOutline == null || !currentScenarioOutline.equals(scenarioOutline)) {
-                currentScenarioOutline = scenarioOutline;
-                createScenarioOutline(currentScenarioOutline);
+            if (currentScenarioOutline.get() == null || !currentScenarioOutline.get().getName().equals(scenarioOutline.getName())) {
+                scenarioOutlineThreadLocal.set(null);
+                createScenarioOutline(scenarioOutline);
+                currentScenarioOutline.set(scenarioOutline);
                 addOutlineStepsToReport(scenarioOutline);
             }
             Examples examples = (Examples)astNode.parent.node;
-            if (currentExamples == null || !currentExamples.equals(examples)) {
-                currentExamples = examples;
-                createExamples(currentExamples);
+            if (currentExamples.get() == null || !currentExamples.get().equals(examples)) {
+                currentExamples.set(examples);
+                createExamples(examples);
             }
         } else {
             scenarioOutlineThreadLocal.set(null);
-            currentScenarioOutline = null;
-            currentExamples = null;
+            currentScenarioOutline.set(null);
+            currentExamples.set(null);
         }
     }
 
@@ -237,7 +288,7 @@ public class ExtentCucumberAdapter
                 if (argument instanceof DocString) {
                     createDocStringMap((DocString)argument);
                 } else if (argument instanceof DataTable) {
-                    createDataTableList((DataTable)argument);
+                    
                 }
             }
         }
@@ -247,14 +298,6 @@ public class ExtentCucumberAdapter
         Map<String, Object> docStringMap = new HashMap<String, Object>();
         docStringMap.put("value", docString.getContent());
         return docStringMap;
-    }
-
-    private List<Map<String, Object>> createDataTableList(DataTable dataTable) {
-        List<Map<String, Object>> rowList = new ArrayList<Map<String, Object>>();
-        for (TableRow row : dataTable.getRows()) {
-            rowList.add(createRowMap(row));
-        }
-        return rowList;
     }
 
     private Map<String, Object> createRowMap(TableRow row) {
@@ -276,7 +319,10 @@ public class ExtentCucumberAdapter
         rows.add(examples.getTableHeader());
         rows.addAll(examples.getTableBody());
         String[][] data = getTable(rows);
-        String markup = examples.getName() + MarkupHelper.createTable(data).getMarkup();
+        String markup = MarkupHelper.createTable(data).getMarkup();
+        if (examples.getName() != null && !examples.getName().isEmpty()) {
+            markup = "<div class='mt-2 label blue white-text inline-block'>" + examples.getName() + "</div>" + markup;
+        }
         markup = scenarioOutlineThreadLocal.get().getModel().getDescription() + markup;
         scenarioOutlineThreadLocal.get().getModel().setDescription(markup);
     }
@@ -299,7 +345,7 @@ public class ExtentCucumberAdapter
     }
 
     private void createTestCase(TestCase testCase) {
-        TestSourcesModel.AstNode astNode = testSources.getAstNode(currentFeatureFile, testCase.getLine());
+        TestSourcesModel.AstNode astNode = testSources.getAstNode(currentFeatureFile.get(), testCase.getLine());
         if (astNode != null) {
             ScenarioDefinition scenarioDefinition = TestSourcesModel.getScenarioDefinition(astNode);
             ExtentTest parent = scenarioOutlineThreadLocal.get() != null ? scenarioOutlineThreadLocal.get() : featureTestThreadLocal.get();
@@ -311,36 +357,9 @@ public class ExtentCucumberAdapter
         }
     }
 
-    private void createBackground(TestCase testCase) {
-        TestSourcesModel.AstNode astNode = testSources.getAstNode(currentFeatureFile, testCase.getLine());
-        if (astNode != null) {
-            @SuppressWarnings("unused")
-            Background background = TestSourcesModel.getBackgroundForTestCase(astNode);
-            // background.getName();
-        }
-    }
-
-    private boolean isFirstStepAfterBackground(TestStep testStep) {
-        TestSourcesModel.AstNode astNode = testSources.getAstNode(currentFeatureFile, testStep.getStepLine());
-        if (astNode != null) {
-            if (currentTestCaseMap != null && !TestSourcesModel.isBackgroundStep(astNode)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private void createTestStep(TestStep testStep) {
         String stepName = testStep.getStepText();
-        if (!testStep.getStepArgument().isEmpty()) {
-            Argument argument = testStep.getStepArgument().get(0);
-            if (argument instanceof PickleString) {
-                createDocStringMap((PickleString)argument);
-            } else if (argument instanceof PickleTable) {
-                createDataTableList((PickleTable)argument);
-            }
-        }
-        TestSourcesModel.AstNode astNode = testSources.getAstNode(currentFeatureFile, testStep.getStepLine());
+        TestSourcesModel.AstNode astNode = testSources.getAstNode(currentFeatureFile.get(), testStep.getStepLine());
         if (astNode != null) {
             Step step = (Step) astNode.node;
             try {
@@ -354,61 +373,65 @@ public class ExtentCucumberAdapter
                 e.printStackTrace();
             }
         }
+        if (!testStep.getStepArgument().isEmpty()) {
+            Argument argument = testStep.getStepArgument().get(0);
+            if (argument instanceof PickleString) {
+                createDocStringMap((PickleString)argument);
+            } else if (argument instanceof PickleTable) {
+                List<PickleRow> rows = ((PickleTable) argument).getRows();
+                stepTestThreadLocal.get().pass(MarkupHelper.createTable(getPickleTable(rows)).getMarkup());
+            }
+        }
     }
 
+    private String[][] getPickleTable(List<PickleRow> rows) {
+        String data[][] = null;
+        int rowSize = rows.size();
+        for (int i = 0; i < rowSize; i++) {
+            PickleRow row = rows.get(i);
+            List<PickleCell> cells = row.getCells();
+            int cellSize = cells.size();
+            if (data == null) {
+                data = new String[rowSize][cellSize];
+            }
+            for (int j = 0; j < cellSize; j++) {
+                data[i][j] = cells.get(j).getValue();
+            }
+        }
+        return data;
+    }
+    
     private Map<String, Object> createDocStringMap(PickleString docString) {
         Map<String, Object> docStringMap = new HashMap<String, Object>();
         docStringMap.put("value", docString.getContent());
         return docStringMap;
     }
 
-    private List<Map<String, Object>> createDataTableList(PickleTable dataTable) {
-        List<Map<String, Object>> rowList = new ArrayList<Map<String, Object>>();
-        for (PickleRow row : dataTable.getRows()) {
-            rowList.add(createRowMap(row));
-        }
-        return rowList;
-    }
-
-    private Map<String, Object> createRowMap(PickleRow row) {
-        Map<String, Object> rowMap = new HashMap<String, Object>();
-        rowMap.put("cells", createCellList(row));
-        return rowMap;
-    }
-
-    private List<String> createCellList(PickleRow row) {
-        List<String> cells = new ArrayList<String>();
-        for (PickleCell cell : row.getCells()) {
-            cells.add(cell.getValue());
-        }
-        return cells;
-    }
-
-    private Map<String, Object> createMatchMap(TestStep testStep, Result result) {
-        Map<String, Object> matchMap = new HashMap<String, Object>();
-        if (!result.is(Result.Type.UNDEFINED)) {
-            matchMap.put("location", testStep.getCodeLocation());
-        }
-        return matchMap;
-    }
-
-    private void createResultMap(Result result) {
+    private synchronized void updateResult(Result result) {
         switch (result.getStatus().lowerCaseName()) {
             case "failed":
                 stepTestThreadLocal.get().fail(result.getError());
                 break;
             case "skipped":
-                stepTestThreadLocal.get().skip(result.getError());
+            case "pending":
+                Boolean currentEndingEventSkipped = stepTestThreadLocal.get().getModel().getLogContext() != null 
+                    && !stepTestThreadLocal.get().getModel().getLogContext().isEmpty()
+                        ? stepTestThreadLocal.get().getModel().getLogContext().getLast().getStatus() == Status.SKIP
+                        : false;
+                if (result.getError() != null) {
+                    stepTestThreadLocal.get().skip(result.getError());
+                } else if (!currentEndingEventSkipped) {
+                    String details = result.getErrorMessage() == null ? "Step skipped" : result.getErrorMessage();
+                    stepTestThreadLocal.get().skip(details);
+                }
                 break;
             case "passed":
                 if (stepTestThreadLocal.get()!= null && stepTestThreadLocal.get().getModel().getLogContext().isEmpty())
-                    stepTestThreadLocal.get().pass("Step passed");
+                    stepTestThreadLocal.get().pass("");
                 break;
             default:
                 break;
         }
     }
-
-    private void jsFunctionCall(String functionName, Object... args) { }
     
 }
